@@ -1,77 +1,176 @@
-from machine import Pin
-import rp2
+from machine import Pin, PWM, I2C
 import network
 import time
 import math
-import ujson
-import usocket
 import gc
+import neopixel
 
 gc.collect()
-# This is code from AI, cause most sources are very confusing and I have no idea how to do this otherwise
 
-## ----------- Transmitter -------------- ##
+# ----------- Hardware Setup -------------- #
 
-def transmitterCode():
-  ap = network.WLAN(network.AP_IF)                  # Create AP Object (Broadcasts WI-FI), AP_IF makes it act as a WIFI hotspot
-  ap.active(True)                                   # Turn Wi-Fi AP on
-  ap.config(essid ="PicoAP", password="Pico123")    # Set up the wifi name and password
-  print("AP Started:", ap.ipconfig())               # Print out info to see if it 
-  
-  while True:
-    stations = ap.status('stations')                # Get a list of (MAC_bytes, rssi_int) tuples for connected clients
-  
-    if stations:
-      for mac, rssi in stations:                    # Get RSSI
-        print("Connected device MAC:", mac, "RSSI:", rssi)
-    else:
-      print("No Stations Connected")
+# Buzzer
+buzzer = PWM(Pin(15))
+BASE_FREQ = 800
+buzzer.freq(BASE_FREQ)
 
-    time.sleep(2)                                   # Replace this with a timer system
+# NeoPixel
+NUM_LEDS = 8
+np = neopixel.NeoPixel(Pin(18), NUM_LEDS)
 
-## ------------- Scanner ---------------- ##
+# ----------- MPU6050 Setup -------------- #
 
-def scannerCode():
-  wlan = network.WLAN(network.STA_IF)               # Create Station Object (Like a phone scanning wi-fi)
-  wlan.active(True)                                 # Turn WIFI Scanning on
-  wlan.connect("PicoAP", "Pico123")                 # Connect to the WIFI
-  
-  # while not wlan.isconnected():       
-  #   time.sleep(1)
+sda = Pin(4, Pin.IN, Pin.PULL_UP)
+scl = Pin(5, Pin.IN, Pin.PULL_UP)
+i2c = I2C(0, sda=sda, scl=scl, freq=200000)
+MPU_ADDR = 0x68
+GYRO_Z = 0x47
 
-  AP_IP = "192.168.4.1"                # AP's fixed IP address (always this when hosting)
-  sock = usocket.socket()              # Create empty "mailbox" for UDP messages
-  sock.connect((AP_IP, 12345))         # Point mailbox at AP's IP + port 12345
-  
-  print("Connected")
-  
-  
-  while True:
-    rssi = wlan.status('rssi')                       # Get RSSI
-    print("RSSI:", rssi_to_distance(rssi))
-    data = ujson.dumps({"rssi": rssi_to_distance(rssi)})  # Turn RSSI into text: '{"rssi":-55}'
-    sock.send(data)                  # Mail the text to AP (fire and forget UDP)
-    time.sleep(2)                                    # Replace this with a timer system
+print("I2C Devices:", i2c.scan())
+
+# Wake MPU6050
+i2c.writeto(MPU_ADDR, b'\x6B\x00')
+time.sleep_ms(100)
+
+# ----------- Distance + Sound Settings -------------- #
+
+MAX_DISTANCE = 20
+MAX_DUTY = 65535
+
+BEEP_DURATION_MS = 80
+MIN_INTERVAL = 200
+MAX_INTERVAL = 2000
+
+# ----------- Helper Functions -------------- #
+
+def read_gyro_z():
+    i2c.writeto(MPU_ADDR, bytes([GYRO_Z]))
+    high = i2c.readfrom(MPU_ADDR, 1)[0]
+    i2c.writeto(MPU_ADDR, bytes([GYRO_Z + 1]))
+    low = i2c.readfrom(MPU_ADDR, 1)[0]
+
+    gz_raw = (high << 8) | low
+    if gz_raw > 32767:
+        gz_raw -= 65536
+
+    return gz_raw / 131.0  # deg/sec
 
 
+def update_buzzer_frequency(gz):
+    # Clamp rotation to reasonable range
+    max_rotation = 200
+    if gz > max_rotation:
+        gz = max_rotation
+    if gz < -max_rotation:
+        gz = -max_rotation
 
-## ---------- Distance Formula ---------- ##
-# The formula to convert dBm to Meters
+    # Map rotation magnitude to frequency shift
+    freq_shift = int(abs(gz) * 5)
+    buzzer.freq(BASE_FREQ + freq_shift)
+
+
+def clamp_distance(distance):
+    if distance == float('inf'):
+        return MAX_DISTANCE
+    if distance < 0:
+        return 0
+    if distance > MAX_DISTANCE:
+        return MAX_DISTANCE
+    return distance
+
+
+def duty_from_distance(distance):
+    distance = clamp_distance(distance)
+    return int((distance / MAX_DISTANCE) * MAX_DUTY)
+
+
+def interval_from_distance(distance):
+    distance = clamp_distance(distance)
+    ratio = distance / MAX_DISTANCE
+    return int(MIN_INTERVAL + (ratio * (MAX_INTERVAL - MIN_INTERVAL)))
+
+
+def leds_from_distance(distance):
+    distance = clamp_distance(distance)
+
+    ratio = 1 - (distance / MAX_DISTANCE)
+    led_count = int(ratio * NUM_LEDS)
+
+    np.fill((0, 0, 0))
+
+    for i in range(led_count):
+        r = 250 - (led_count * 25)
+        g = led_count * 25
+        np[i] = (r, g, 0)
+
+    np.write()
+
+
+def beep(duty):
+    buzzer.duty_u16(duty)
+    time.sleep_ms(BEEP_DURATION_MS)
+    buzzer.duty_u16(0)
+
+
+# ---------- Distance Formula ---------- #
 
 def rssi_to_distance(rssi, P0=-50, n=2.5):
-  if rssi == 0:
-    return float('inf')
-
-  return 10 ** ((P0 - rssi) / (10 * n))
-
-## -------------------------------------- ##
-
-scannerCode()
+    if rssi == 0:
+        return float('inf')
+    return 10 ** ((P0 - rssi) / (10 * n))
 
 
+# ------------- Main Scanner ---------------- #
+
+def scannerCode():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect("PicoAP", "Pico12345678")
+
+    print("Connected")
+
+    last_beep_time = time.ticks_ms()
+
+    while True:
+        # --- Distance ---
+        rssi = wlan.status('rssi')
+        distance = rssi_to_distance(rssi)
+
+        duty = duty_from_distance(distance)
+        interval = interval_from_distance(distance)
+
+        leds_from_distance(distance)
+
+        # --- Gyro ---
+        gz = read_gyro_z()
+        update_buzzer_frequency(gz)
+
+        print("Distance:", distance, "| Gyro Z:", gz)
+
+        now = time.ticks_ms()
+        if time.ticks_diff(now, last_beep_time) >= interval:
+            beep(duty)
+            last_beep_time = now
+
+        time.sleep_ms(100)
 
 
+# ----------- Run -------------- #
 
+try:
+    scannerCode()
 
+except KeyboardInterrupt:
+    print("Stopping...")
 
+finally:
+    buzzer.duty_u16(0)
+    buzzer.deinit()
 
+    np.fill((0, 0, 0))
+    np.write()
+
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(False)
+
+    print("All systems shut down.")
