@@ -38,7 +38,7 @@ time.sleep_ms(100)
 
 # ----------- Distance + Sound Settings -------------- #
 
-MAX_DISTANCE = 20
+MAX_DISTANCE = 5
 MAX_DUTY = 65535
 
 BEEP_DURATION_MS = 80
@@ -98,7 +98,7 @@ def leds_from_distance(distance):
     distance = clamp_distance(distance)
 
     ratio = 1 - (distance / MAX_DISTANCE)
-    led_count = int(ratio * NUM_LEDS)
+    led_count = math.ceil(ratio * NUM_LEDS)
 
     np.fill((0, 0, 0))
 
@@ -155,7 +155,7 @@ try:
   # Send UDP to AP (always 192.168.4.1)
   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
   # message = f"RSSI: {rssi}".encode()
-  message = ujson.dumps({"rssi":rssi}).encode()
+  message = ujson.dumps({"dist":rssi}).encode()
   # message = b"RSSI: {rssi}"
 
   last_beep_time = time.ticks_ms()
@@ -164,7 +164,7 @@ try:
       rssi = wlan.status('rssi')  # Bonus: current connection RSSI
       distance = rssi_to_distance(rssi)
       # message = f"RSSI: {distance}".encode()
-      message = ujson.dumps({"rssi":distance}).encode()
+      message = ujson.dumps({"dist":distance}).encode()
       sock.sendto(message, ("192.168.4.1", 12345))
       print("Sent UDP to AP")
       print(f"RSSI: {rssi}")
@@ -172,7 +172,7 @@ try:
     #____________________________________________________
       duty = duty_from_distance(distance)
       interval = interval_from_distance(distance)
-
+    
       leds_from_distance(distance)
 
       # --- Gyro ---
@@ -182,13 +182,16 @@ try:
       print("Distance:", distance, "| Gyro Z:", gz)
 
       now = time.ticks_ms()
+    
       if time.ticks_diff(now, last_beep_time) >= interval:
           beep(duty)
           last_beep_time = now
+      # print(f'Time_Int: {time.ticks_diff(now, last_beep_time)}')
+      # print(f'Interval: {interval}')
 
       
     #____________________________________________________
-      time.sleep_ms(1000)
+      time.sleep_ms(100)
 
 finally:
   sock.close()
